@@ -150,17 +150,21 @@ def resize_image(im: np.ndarray, width: int, height: int, resize_mode: int = 1) 
             if ratio < src_ratio:
                 fill_height = height // 2 - src_h // 2
                 if fill_height > 0:
-                    top_fill = resized.resize((width, fill_height), box=(0, 0, width, 0))
-                    bottom_fill = resized.resize((width, fill_height), 
-                                               box=(0, resized.height, width, resized.height))
+                    # Take a 1-pixel tall strip from top and bottom edges and stretch
+                    top_strip = resized.crop((0, 0, resized.width, 1))
+                    bottom_strip = resized.crop((0, resized.height - 1, resized.width, resized.height))
+                    top_fill = top_strip.resize((width, fill_height))
+                    bottom_fill = bottom_strip.resize((width, fill_height))
                     res.paste(top_fill, box=(0, 0))
                     res.paste(bottom_fill, box=(0, fill_height + src_h))
             elif ratio > src_ratio:
                 fill_width = width // 2 - src_w // 2
                 if fill_width > 0:
-                    left_fill = resized.resize((fill_width, height), box=(0, 0, 0, height))
-                    right_fill = resized.resize((fill_width, height), 
-                                              box=(resized.width, 0, resized.width, height))
+                    # Take a 1-pixel wide strip from left and right edges and stretch
+                    left_strip = resized.crop((0, 0, 1, resized.height))
+                    right_strip = resized.crop((resized.width - 1, 0, resized.width, resized.height))
+                    left_fill = left_strip.resize((fill_width, height))
+                    right_fill = right_strip.resize((fill_width, height))
                     res.paste(left_fill, box=(0, 0))
                     res.paste(right_fill, box=(fill_width + src_w, 0))
 
