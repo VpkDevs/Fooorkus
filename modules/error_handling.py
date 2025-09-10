@@ -85,6 +85,10 @@ class EnhancedLogger:
         """Setup logging configuration."""
         self.logger.setLevel(logging.DEBUG)
         
+        # Check if handlers already exist to avoid duplication
+        if self.logger.handlers:
+            return
+        
         # Create formatter
         formatter = logging.Formatter(
             '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
