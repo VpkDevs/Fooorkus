@@ -1,4 +1,6 @@
 from pathlib import Path
+from typing import List, Tuple, AnyStr, NamedTuple, Optional, Union, Any, Dict
+import logging
 
 import numpy as np
 import datetime
@@ -7,8 +9,6 @@ import math
 import os
 import cv2
 import re
-from typing import List, Tuple, AnyStr, NamedTuple
-
 import json
 import hashlib
 
@@ -17,6 +17,9 @@ from PIL import Image
 import modules.config
 import modules.sdxl_styles
 from modules.flags import Performance
+
+# Set up logging for better error tracking and debugging
+logger = logging.getLogger(__name__)
 
 LANCZOS = (Image.Resampling.LANCZOS if hasattr(Image, 'Resampling') else Image.LANCZOS)
 
@@ -28,95 +31,212 @@ LORAS_PROMPT_PATTERN = re.compile(r"(<lora:([^:]+):([+-]?(?:\d+(?:\.\d*)?|\.\d+)
 HASH_SHA256_LENGTH = 10
 
 
-def erode_or_dilate(x, k):
+def erode_or_dilate(x: np.ndarray, k: Union[int, float]) -> np.ndarray:
+    """
+    Apply erosion or dilation to an image based on the kernel size.
+    
+    Args:
+        x: Input image as numpy array
+        k: Kernel size. Positive values dilate, negative values erode, zero returns original
+        
+    Returns:
+        Processed image as numpy array
+        
+    Raises:
+        ValueError: If input array is invalid
+    """
+    if not isinstance(x, np.ndarray):
+        raise ValueError("Input must be a numpy array")
+        
     k = int(k)
     if k > 0:
         return cv2.dilate(x, kernel=np.ones(shape=(3, 3), dtype=np.uint8), iterations=k)
-    if k < 0:
+    elif k < 0:
         return cv2.erode(x, kernel=np.ones(shape=(3, 3), dtype=np.uint8), iterations=-k)
-    return x
+    else:
+        return x
 
 
-def resample_image(im, width, height):
-    im = Image.fromarray(im)
-    im = im.resize((int(width), int(height)), resample=LANCZOS)
-    return np.array(im)
-
-
-def resize_image(im, width, height, resize_mode=1):
+def resample_image(im: np.ndarray, width: Union[int, float], height: Union[int, float]) -> np.ndarray:
     """
-    Resizes an image with the specified resize_mode, width, and height.
+    Resample an image to new dimensions using Lanczos interpolation.
+    
+    Args:
+        im: Input image as numpy array
+        width: Target width
+        height: Target height
+        
+    Returns:
+        Resampled image as numpy array
+        
+    Raises:
+        ValueError: If dimensions are invalid
+    """
+    if width <= 0 or height <= 0:
+        raise ValueError("Width and height must be positive values")
+        
+    try:
+        im = Image.fromarray(im)
+        im = im.resize((int(width), int(height)), resample=LANCZOS)
+        return np.array(im)
+    except Exception as e:
+        logger.error(f"Failed to resample image: {e}")
+        raise
+
+
+def resize_image(im: np.ndarray, width: int, height: int, resize_mode: int = 1) -> np.ndarray:
+    """
+    Resize an image with the specified resize_mode, width, and height.
 
     Args:
-        resize_mode: The mode to use when resizing the image.
-            0: Resize the image to the specified width and height.
-            1: Resize the image to fill the specified width and height, maintaining the aspect ratio, and then center the image within the dimensions, cropping the excess.
-            2: Resize the image to fit within the specified width and height, maintaining the aspect ratio, and then center the image within the dimensions, filling empty with data from image.
-        im: The image to resize.
-        width: The width to resize the image to.
-        height: The height to resize the image to.
+        im: The input image as numpy array
+        width: The target width to resize the image to
+        height: The target height to resize the image to
+        resize_mode: The mode to use when resizing the image:
+            0: Resize the image to the specified width and height (stretch)
+            1: Resize the image to fill the specified width and height, maintaining 
+               aspect ratio, then center and crop excess (default)
+            2: Resize the image to fit within the specified width and height, 
+               maintaining aspect ratio, then center and pad with image data
+               
+    Returns:
+        Resized image as numpy array
+        
+    Raises:
+        ValueError: If resize_mode is invalid or dimensions are non-positive
     """
+    if width <= 0 or height <= 0:
+        raise ValueError("Width and height must be positive integers")
+    
+    if resize_mode not in [0, 1, 2]:
+        raise ValueError("resize_mode must be 0, 1, or 2")
 
-    im = Image.fromarray(im)
+    try:
+        im = Image.fromarray(im)
 
-    def resize(im, w, h):
-        return im.resize((w, h), resample=LANCZOS)
+        def resize(img: Image.Image, w: int, h: int) -> Image.Image:
+            """Helper function to resize with Lanczos resampling."""
+            return img.resize((w, h), resample=LANCZOS)
 
-    if resize_mode == 0:
-        res = resize(im, width, height)
+        if resize_mode == 0:
+            # Simple stretch resize
+            res = resize(im, width, height)
 
-    elif resize_mode == 1:
-        ratio = width / height
-        src_ratio = im.width / im.height
+        elif resize_mode == 1:
+            # Maintain aspect ratio, center and crop
+            ratio = width / height
+            src_ratio = im.width / im.height
 
-        src_w = width if ratio > src_ratio else im.width * height // im.height
-        src_h = height if ratio <= src_ratio else im.height * width // im.width
+            src_w = width if ratio > src_ratio else im.width * height // im.height
+            src_h = height if ratio <= src_ratio else im.height * width // im.width
 
-        resized = resize(im, src_w, src_h)
-        res = Image.new("RGB", (width, height))
-        res.paste(resized, box=(width // 2 - src_w // 2, height // 2 - src_h // 2))
+            resized = resize(im, src_w, src_h)
+            res = Image.new("RGB", (width, height))
+            res.paste(resized, box=(width // 2 - src_w // 2, height // 2 - src_h // 2))
 
-    else:
-        ratio = width / height
-        src_ratio = im.width / im.height
+        else:  # resize_mode == 2
+            # Maintain aspect ratio, center and pad
+            ratio = width / height
+            src_ratio = im.width / im.height
 
-        src_w = width if ratio < src_ratio else im.width * height // im.height
-        src_h = height if ratio >= src_ratio else im.height * width // im.width
+            src_w = width if ratio < src_ratio else im.width * height // im.height
+            src_h = height if ratio >= src_ratio else im.height * width // im.width
 
-        resized = resize(im, src_w, src_h)
-        res = Image.new("RGB", (width, height))
-        res.paste(resized, box=(width // 2 - src_w // 2, height // 2 - src_h // 2))
+            resized = resize(im, src_w, src_h)
+            res = Image.new("RGB", (width, height))
+            res.paste(resized, box=(width // 2 - src_w // 2, height // 2 - src_h // 2))
 
-        if ratio < src_ratio:
-            fill_height = height // 2 - src_h // 2
-            if fill_height > 0:
-                res.paste(resized.resize((width, fill_height), box=(0, 0, width, 0)), box=(0, 0))
-                res.paste(resized.resize((width, fill_height), box=(0, resized.height, width, resized.height)), box=(0, fill_height + src_h))
-        elif ratio > src_ratio:
-            fill_width = width // 2 - src_w // 2
-            if fill_width > 0:
-                res.paste(resized.resize((fill_width, height), box=(0, 0, 0, height)), box=(0, 0))
-                res.paste(resized.resize((fill_width, height), box=(resized.width, 0, resized.width, height)), box=(fill_width + src_w, 0))
+            # Fill empty areas with stretched image content
+            if ratio < src_ratio:
+                fill_height = height // 2 - src_h // 2
+                if fill_height > 0:
+                    top_fill = resized.resize((width, fill_height), box=(0, 0, width, 0))
+                    bottom_fill = resized.resize((width, fill_height), 
+                                               box=(0, resized.height, width, resized.height))
+                    res.paste(top_fill, box=(0, 0))
+                    res.paste(bottom_fill, box=(0, fill_height + src_h))
+            elif ratio > src_ratio:
+                fill_width = width // 2 - src_w // 2
+                if fill_width > 0:
+                    left_fill = resized.resize((fill_width, height), box=(0, 0, 0, height))
+                    right_fill = resized.resize((fill_width, height), 
+                                              box=(resized.width, 0, resized.width, height))
+                    res.paste(left_fill, box=(0, 0))
+                    res.paste(right_fill, box=(fill_width + src_w, 0))
 
-    return np.array(res)
+        return np.array(res)
+        
+    except Exception as e:
+        logger.error(f"Failed to resize image: {e}")
+        raise
 
 
-def get_shape_ceil(h, w):
+def get_shape_ceil(h: Union[int, float], w: Union[int, float]) -> float:
+    """
+    Calculate ceiling shape based on height and width, aligned to 64-pixel boundaries.
+    
+    Args:
+        h: Height dimension
+        w: Width dimension
+        
+    Returns:
+        Ceiling shape value aligned to 64-pixel boundaries
+        
+    Raises:
+        ValueError: If dimensions are non-positive
+    """
+    if h <= 0 or w <= 0:
+        raise ValueError("Height and width must be positive values")
+        
     return math.ceil(((h * w) ** 0.5) / 64.0) * 64.0
 
 
-def get_image_shape_ceil(im):
+def get_image_shape_ceil(im: np.ndarray) -> float:
+    """
+    Get ceiling shape for an image array.
+    
+    Args:
+        im: Input image as numpy array
+        
+    Returns:
+        Ceiling shape value for the image
+        
+    Raises:
+        ValueError: If image array is invalid
+    """
+    if not isinstance(im, np.ndarray) or len(im.shape) < 2:
+        raise ValueError("Input must be a valid image array with at least 2 dimensions")
+        
     H, W = im.shape[:2]
     return get_shape_ceil(H, W)
 
 
-def set_image_shape_ceil(im, shape_ceil):
+def set_image_shape_ceil(im: np.ndarray, shape_ceil: Union[int, float]) -> np.ndarray:
+    """
+    Adjust image dimensions to match a target shape ceiling value.
+    
+    Args:
+        im: Input image array
+        shape_ceil: Target shape ceiling value
+        
+    Returns:
+        Resized image array
+        
+    Raises:
+        ValueError: If inputs are invalid
+    """
+    if not isinstance(im, np.ndarray) or len(im.shape) != 3:
+        raise ValueError("Input must be a 3D image array (H, W, C)")
+        
     shape_ceil = float(shape_ceil)
+    if shape_ceil <= 0:
+        raise ValueError("Shape ceiling must be positive")
 
     H_origin, W_origin, _ = im.shape
     H, W = H_origin, W_origin
     
-    for _ in range(256):
+    # Iteratively adjust dimensions to match target shape ceiling
+    for iteration in range(256):  # Prevent infinite loops
         current_shape_ceil = get_shape_ceil(H, W)
         if abs(current_shape_ceil - shape_ceil) < 0.1:
             break
@@ -124,29 +244,58 @@ def set_image_shape_ceil(im, shape_ceil):
         H = int(round(float(H) * k / 64.0) * 64)
         W = int(round(float(W) * k / 64.0) * 64)
 
+    # Return original if dimensions unchanged
     if H == H_origin and W == W_origin:
         return im
 
     return resample_image(im, width=W, height=H)
 
 
-def HWC3(x):
-    assert x.dtype == np.uint8
+def HWC3(x: np.ndarray) -> np.ndarray:
+    """
+    Convert image to HWC format with 3 channels (RGB).
+    
+    Handles grayscale (1 channel), RGB (3 channels), and RGBA (4 channels) inputs.
+    
+    Args:
+        x: Input image array with shape (H, W) or (H, W, C)
+        
+    Returns:
+        RGB image array with shape (H, W, 3)
+        
+    Raises:
+        AssertionError: If input format is invalid
+        ValueError: If input dtype is not uint8
+    """
+    if not isinstance(x, np.ndarray):
+        raise ValueError("Input must be a numpy array")
+        
+    if x.dtype != np.uint8:
+        raise ValueError("Input array must have dtype uint8")
+    
+    # Convert 2D grayscale to 3D
     if x.ndim == 2:
         x = x[:, :, None]
-    assert x.ndim == 3
+    
+    if x.ndim != 3:
+        raise ValueError("Input must be 2D or 3D array")
+        
     H, W, C = x.shape
-    assert C == 1 or C == 3 or C == 4
+    
+    if C not in [1, 3, 4]:
+        raise ValueError("Input must have 1, 3, or 4 channels")
+    
     if C == 3:
         return x
-    if C == 1:
+    elif C == 1:
+        # Convert grayscale to RGB by duplicating channel
         return np.concatenate([x, x, x], axis=2)
-    if C == 4:
+    else:  # C == 4
+        # Convert RGBA to RGB with alpha blending
         color = x[:, :, 0:3].astype(np.float32)
         alpha = x[:, :, 3:4].astype(np.float32) / 255.0
         y = color * alpha + 255.0 * (1.0 - alpha)
-        y = y.clip(0, 255).astype(np.uint8)
-        return y
+        return y.clip(0, 255).astype(np.uint8)
 
 
 def remove_empty_str(items, default=None):

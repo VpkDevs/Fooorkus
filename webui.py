@@ -23,74 +23,182 @@ from modules.private_logger import get_current_html_path
 from modules.ui_gradio_extensions import reload_javascript
 from modules.auth import auth_enabled, check_auth
 from modules.util import is_json
+from modules.error_handling import (
+    enhanced_logger, handle_errors, monitor_performance, validate_input,
+    ErrorCategory, CommonErrors, is_positive_number, is_non_empty_string
+)
+from typing import Generator, Tuple, Any
 
-def get_task(*args):
+@validate_input({
+    'task': lambda x: hasattr(x, 'args') and isinstance(x.args, list)
+})
+@handle_errors(
+    ErrorCategory.IMAGE_GENERATION,
+    "An error occurred during image generation. Please try again.",
+    suggestions=[
+        "Check your prompt and settings",
+        "Ensure sufficient system resources",
+        "Try reducing image resolution if memory issues occur"
+    ]
+)
+def get_task(*args) -> worker.AsyncTask:
+    """
+    Create an AsyncTask from input arguments with enhanced validation.
+    
+    Args:
+        *args: Variable arguments for task creation
+        
+    Returns:
+        AsyncTask instance ready for processing
+        
+    Raises:
+        ValueError: If arguments are invalid
+    """
     args = list(args)
-    args.pop(0)
+    
+    if len(args) == 0:
+        enhanced_logger.logger.warning("Empty arguments provided to get_task")
+        
+    # Remove the first argument (typically gradio request data)
+    if args:
+        args.pop(0)
 
     return worker.AsyncTask(args=args)
 
-def generate_clicked(task: worker.AsyncTask):
+@monitor_performance("image_generation")
+@handle_errors(
+    ErrorCategory.IMAGE_GENERATION,
+    "Image generation failed. Please check your settings and try again.",
+    suggestions=[
+        "Verify your prompt is not empty",
+        "Check system resources and memory",
+        "Try reducing batch size or image resolution",
+        "Restart the application if issues persist"
+    ],
+    reraise=False
+)
+def generate_clicked(task: worker.AsyncTask) -> Generator[Tuple[Any, ...], None, None]:
+    """
+    Enhanced image generation function with comprehensive error handling and monitoring.
+    
+    Args:
+        task: AsyncTask containing generation parameters
+        
+    Yields:
+        Gradio update tuples for UI updates during generation
+        
+    Raises:
+        Various exceptions handled by decorator
+    """
     import ldm_patched.modules.model_management as model_management
 
-    with model_management.interrupt_processing_mutex:
-        model_management.interrupt_processing = False
-    # outputs=[progress_html, progress_window, progress_gallery, gallery]
+    try:
+        with model_management.interrupt_processing_mutex:
+            model_management.interrupt_processing = False
+        
+        # Validate task has arguments
+        if not hasattr(task, 'args') or len(task.args) == 0:
+            enhanced_logger.logger.warning("Empty task arguments in generate_clicked")
+            yield gr.update(visible=True, value=modules.html.make_progress_html(100, 'No generation parameters provided')), \
+                gr.update(visible=False), \
+                gr.update(visible=False), \
+                gr.update(visible=False)
+            return
 
-    if len(task.args) == 0:
-        return
+        execution_start_time = time.perf_counter()
+        finished = False
 
-    execution_start_time = time.perf_counter()
-    finished = False
+        # Initial progress indication
+        yield gr.update(visible=True, value=modules.html.make_progress_html(1, 'Initializing generation...')), \
+            gr.update(visible=True, value=None), \
+            gr.update(visible=False, value=None), \
+            gr.update(visible=False)
 
-    yield gr.update(visible=True, value=modules.html.make_progress_html(1, 'Waiting for task to start ...')), \
-        gr.update(visible=True, value=None), \
-        gr.update(visible=False, value=None), \
-        gr.update(visible=False)
+        # Add task to processing queue
+        worker.async_tasks.append(task)
+        enhanced_logger.logger.info(f"Started image generation task with {len(task.args)} parameters")
 
-    worker.async_tasks.append(task)
+        # Process task results
+        while not finished:
+            try:
+                time.sleep(0.01)
+                
+                if len(task.yields) > 0:
+                    flag, product = task.yields.pop(0)
+                    
+                    if flag == 'preview':
+                        # Optimize preview handling for better network performance
+                        if len(task.yields) > 0 and task.yields[0][0] == 'preview':
+                            enhanced_logger.logger.debug('Skipping duplicate preview for better performance')
+                            continue
 
-    while not finished:
-        time.sleep(0.01)
-        if len(task.yields) > 0:
-            flag, product = task.yields.pop(0)
-            if flag == 'preview':
+                        percentage, title, image = product
+                        yield gr.update(visible=True, value=modules.html.make_progress_html(percentage, title)), \
+                            gr.update(visible=True, value=image) if image is not None else gr.update(), \
+                            gr.update(), \
+                            gr.update(visible=False)
+                            
+                    elif flag == 'results':
+                        yield gr.update(visible=True), \
+                            gr.update(visible=True), \
+                            gr.update(visible=True, value=product), \
+                            gr.update(visible=False)
+                            
+                    elif flag == 'finish':
+                        # Enhanced output sorting with error handling
+                        try:
+                            if not args_manager.args.disable_enhance_output_sorting:
+                                product = sort_enhance_images(product, task)
+                        except Exception as e:
+                            enhanced_logger.logger.warning(f"Output sorting failed: {e}")
+                            # Continue with unsorted results
 
-                # help bad internet connection by skipping duplicated preview
-                if len(task.yields) > 0:  # if we have the next item
-                    if task.yields[0][0] == 'preview':   # if the next item is also a preview
-                        # print('Skipped one preview for better internet connection.')
-                        continue
+                        yield gr.update(visible=False), \
+                            gr.update(visible=False), \
+                            gr.update(visible=False), \
+                            gr.update(visible=True, value=product)
+                        finished = True
 
-                percentage, title, image = product
-                yield gr.update(visible=True, value=modules.html.make_progress_html(percentage, title)), \
-                    gr.update(visible=True, value=image) if image is not None else gr.update(), \
-                    gr.update(), \
-                    gr.update(visible=False)
-            if flag == 'results':
-                yield gr.update(visible=True), \
-                    gr.update(visible=True), \
-                    gr.update(visible=True, value=product), \
-                    gr.update(visible=False)
-            if flag == 'finish':
-                if not args_manager.args.disable_enhance_output_sorting:
-                    product = sort_enhance_images(product, task)
+                        # Clean up temporary files if image logging is disabled
+                        if args_manager.args.disable_image_log:
+                            cleanup_temp_images(product)
 
-                yield gr.update(visible=False), \
+            except Exception as e:
+                enhanced_logger.logger.error(f"Error during task processing: {e}")
+                # Try to recover gracefully
+                yield gr.update(visible=True, value=modules.html.make_progress_html(100, 'Generation completed with issues')), \
                     gr.update(visible=False), \
                     gr.update(visible=False), \
-                    gr.update(visible=True, value=product)
+                    gr.update(visible=True, value=[])
                 finished = True
 
-                # delete Fooocus temp images, only keep gradio temp images
-                if args_manager.args.disable_image_log:
-                    for filepath in product:
-                        if isinstance(filepath, str) and os.path.exists(filepath):
-                            os.remove(filepath)
+        execution_time = time.perf_counter() - execution_start_time
+        enhanced_logger.logger.info(f'Image generation completed in {execution_time:.2f} seconds')
+        
+    except Exception as e:
+        enhanced_logger.log_error(CommonErrors.model_loading_failed(str(e)))
+        # Provide user-friendly error feedback
+        yield gr.update(visible=True, value=modules.html.make_progress_html(100, 'Generation failed - please try again')), \
+            gr.update(visible=False), \
+            gr.update(visible=False), \
+            gr.update(visible=True, value=[])
 
-    execution_time = time.perf_counter() - execution_start_time
-    print(f'Total time: {execution_time:.2f} seconds')
-    return
+
+@handle_errors(ErrorCategory.FILE_IO, "Failed to clean up temporary files")
+def cleanup_temp_images(product):
+    """
+    Safely clean up temporary image files.
+    
+    Args:
+        product: List of file paths to clean up
+    """
+    for filepath in product:
+        if isinstance(filepath, str) and os.path.exists(filepath):
+            try:
+                os.remove(filepath)
+                enhanced_logger.logger.debug(f"Cleaned up temporary file: {filepath}")
+            except OSError as e:
+                enhanced_logger.logger.warning(f"Could not remove temporary file {filepath}: {e}")
 
 
 def sort_enhance_images(images, task):
